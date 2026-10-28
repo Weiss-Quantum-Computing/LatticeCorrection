@@ -10,47 +10,65 @@
 #include <windows.h>
 #include <iostream>
 #include <iomanip>
+#include <sstream>
 #include <string>
 #include <stdint.h>
 #include <math.h>
 #include "constant.h"
 #include <fstream>
 #include <stdio.h>
+#include <ctype.h>
+#include <string.h>
 #include <time.h>
 using namespace std;
 
-int InitCom(HANDLE);
+enum HeraldState {HERALD_NONE, HERALD_OK, HERALD_INCOMPLETE};
 
+HANDLE openCom(); //open and initialize the COM port, INVALID_HANDLE_VALUE on failure
+int InitCom(HANDLE);
+int SetCom(HANDLE,int *);   //set values to each channels
+int moveChannel(HANDLE,int,int); //relative move of one channel
 void PID(double*,double*,double*, double*,double*,double*,double, double *); //apply algorithm
-void SetCom(HANDLE,double *);   //set values to each channels
-void parseTime(string, struct tm *); //parse string to formated time
+bool parseTime(string, struct tm *); //parse string to formated time
 void openLog(struct tm*, double*, double*, double*); //open log file and load most recent measurement
-void saveLog(struct tm*, double*, double*, double*); //open log file and load most recent measurement
-bool checkHerald(struct tm* ,double*,double*,double*, double*); //check herald file and updates data
+void saveLog(struct tm*, double*, double*, double*); //save the running average as the most recent measurement
+HeraldState checkHerald(struct tm* ,double*,double*,double*, double*); //check herald file and updates data
 bool checkRange (int *);  //check whether the pizeo step is within range
-void readParameter(double*);
-int recenter(int); // recenter the etalon on one axis
+void readParameter(); //override paths, COM port and setpoints from parameters.txt
+void loadSteps(int *); //accumulated steps per axis, kept across restarts
+void saveSteps(int *);
+void warnRange(int *); //warn about axes that have moved further than maxsteps
 
 /*------------------------------------------------------------------------------------------------------*/
 void openLog(struct tm* ts, double* x, double* y, double* z)
     {
     ifstream oLog;
     string timeStamp;
-    char comments[255];
     double temp[6];
+    bool ok=false;
     oLog.open(logF.c_str());
-    oLog.getline(comments,253,'\n');
-    timeStamp=comments;
-    oLog >> temp[0] >> temp[1] >> temp[2] >> temp[3] >> temp[4] >> temp[5];
-    oLog.close();
+    if(oLog.is_open())
+	{
+	getline(oLog,timeStamp);
+	ok=!(oLog >> temp[0] >> temp[1] >> temp[2] >> temp[3] >> temp[4] >> temp[5]).fail();
+	oLog.close();
+	}
+    time_t now=time(NULL);
+    double t=1e10;
+    if(ok&&parseTime(timeStamp,ts))
+	{
+	cout<<"last measurement: "<<timeStamp<<endl;
+	t= difftime(now,mktime(ts));
+	cout<<"time elapsed: "<<t<<endl;
+	}
+    else
+	{
+	ok=false;
+	cout<<"No readable last measurement in "<<logF<<endl;
+	*ts=*localtime(&now);
+	}
     // Now check the values to see if they're sane
-    parseTime(timeStamp,ts);
-    cout<<"last measurement: "<<timeStamp<<endl;
-    struct tm tNow;
-    parseTime(timeStamp,&tNow);
-    double t= difftime(mktime(&tNow),mktime(ts));
-    cout<<"time elapsed: "<<t<<endl;
-    if(temp[0]<100&&temp[2]<100&&temp[1]>1e-4&&temp[1]<10&&temp[3]>1e-4&&temp[3]<10&&t<24*3600)
+    if(ok&&fabs(temp[0])<100&&fabs(temp[2])<100&&temp[1]>1e-4&&temp[1]<10&&temp[3]>1e-4&&temp[3]<10&&t<24*3600)
 	{
 	// it's safe to use these values
 	x[0] = temp[0];
@@ -62,7 +80,7 @@ void openLog(struct tm* ts, double* x, double* y, double* z)
 	}
     else
 	{
-	cout << "Bad values in log file!" << endl;
+	cout << "Bad or old values in log file, starting without a running average" << endl;
 	// overwrite values with some safe defaults
 	x[0] = 0; x[1] = 1e10;
 	y[0] = 0; y[1] = 1e10;
@@ -85,11 +103,25 @@ void saveLog(struct tm* ts, double* x, double* y, double* z)
 
     }
 /*------------------------------------------------------------------------------------------------------*/
+HANDLE openCom()
+    {
+    HANDLE hPort=CreateFileA(comPort.c_str(), GENERIC_READ|GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if(hPort==INVALID_HANDLE_VALUE)	{cerr<<"Fail to open "<<comPort<<endl; return hPort;}
+    if(InitCom(hPort)!=0)
+	{
+	CloseHandle(hPort);
+	return INVALID_HANDLE_VALUE;
+	}
+    return hPort;
+    }
+/*------------------------------------------------------------------------------------------------------*/
 int InitCom(HANDLE hPort)
     {
 	int err = 0; //error flag
 	DCB dcb;
-	GetCommState(hPort, &dcb);
+	memset(&dcb,0,sizeof(dcb));
+	dcb.DCBlength=sizeof(dcb);
+	if(!GetCommState(hPort, &dcb)){cerr<<"Fail to read COM port settings"<<endl; return 1;}
 	DWORD written=0;
 	dcb.BaudRate=921600;
 	dcb.ByteSize=8;
@@ -97,21 +129,22 @@ int InitCom(HANDLE hPort)
 	dcb.StopBits=0;
 	dcb.fDtrControl=0x00;  // flow control: none
 	dcb.fRtsControl=0x00; //flow control:none
-	SetCommState(hPort, &dcb);
-	WriteFile(hPort, &changeToRemote, 4, &written, NULL); //change to remote mode
-	if(written!=4){cerr<<"Fail to initialize COM port"; err =+ 1;}
-	WriteFile(hPort, &setForwardAmp, 8, &written, NULL); //change to remote mode
-	if(written!=8){cerr<<"Fail to set forward amplitude"; err =+ 2;}
-	WriteFile(hPort, &setBackwardAmp, 8, &written, NULL); //change to remote mode
-	if(written!=8){cerr<<"Fail to set backward amplitude"; err =+ 4;}
+	if(!SetCommState(hPort, &dcb)){cerr<<"Fail to set COM port settings"<<endl; return 1;}
+	WriteFile(hPort, changeToRemote, sizeof(changeToRemote)-1, &written, NULL); //change to remote mode
+	if(written!=sizeof(changeToRemote)-1){cerr<<"Fail to initialize COM port"<<endl; err += 2;}
+	WriteFile(hPort, setForwardAmp, sizeof(setForwardAmp)-1, &written, NULL); //set forward amplitude
+	if(written!=sizeof(setForwardAmp)-1){cerr<<"Fail to set forward amplitude"<<endl; err += 4;}
+	WriteFile(hPort, setBackwardAmp, sizeof(setBackwardAmp)-1, &written, NULL); //set backward amplitude
+	if(written!=sizeof(setBackwardAmp)-1){cerr<<"Fail to set backward amplitude"<<endl; err += 8;}
 	return err;
     }
 /*------------------------------------------------------------------------------------------------------*/
-void parseTime(string timeStamp, struct tm *ts)
+bool parseTime(string timeStamp, struct tm *ts)
     {
 	int year, month, day, hour, min, sec;
-	sscanf(timeStamp.c_str(),"%d-%d-%d-%d:%d:%d", &year,&month,&day,&hour,&min,&sec);
+	if(sscanf(timeStamp.c_str(),"%d-%d-%d-%d:%d:%d", &year,&month,&day,&hour,&min,&sec)!=6) return false;
 
+	memset(ts,0,sizeof(*ts));
 	(*ts).tm_year = year-1900;
 	(*ts).tm_mon  = month-1;
 	(*ts).tm_mday = day;
@@ -119,69 +152,140 @@ void parseTime(string timeStamp, struct tm *ts)
 	(*ts).tm_min  = min;
 	(*ts).tm_sec  = sec;
 	(*ts).tm_isdst= -1; //ignore daylight savings issues
-	//mktime(ts);
-
+	return true;
     }
 /*------------------------------------------------------------------------------------------------------*/
-bool checkHerald(struct tm* tOld, double* x, double* y, double* z, double *t)
+HeraldState checkHerald(struct tm* tOld, double* x, double* y, double* z, double *t)
     {
 
     ifstream hOpen;
-    string timeStamp;
-    char comments[255];
     hOpen.open(herald.c_str());
-    if(hOpen.is_open()){
-	double temp[6];
-	hOpen.getline(comments,255,'\n');
-	timeStamp=comments;
-	    hOpen >> temp[0] >> temp[1] >> temp[2] >> temp[3] >> temp[4] >> temp[5];
-	    hOpen.close();
-	    // Now check the values to see if they're sane
-	    if(temp[0]<100&&temp[2]<100&&temp[1]>1e-4&&temp[1]<10&&temp[3]>1e-4&&temp[3]<10)
-		{
-		// it's safe to use these values
-		x[0] = temp[0];
-		x[1] = temp[1];
-		y[0] = temp[2];
-		y[1] = temp[3];
-		z[0] = temp[4];
-		z[1] = temp[5];
-		}
-	    else
-		{
-		cout << "Bad values in herald file!" << endl;
-		// overwrite values with some safe defaults
-		x[0] = 0; x[1] = 1e10;
-		y[0] = 0; y[1] = 1e10;
-		z[0] = 0; z[1] = 1e10;
-		}
-	cout<<"current measurement: "<<timeStamp<<endl;	//for (short i=0;i<2;i++) {cout<<x[i]<<"\t"<<y[i]<<"\t"<<z[i]<<endl;}
+    if(!hOpen.is_open()) {return HERALD_NONE;}
+    stringstream buf;
+    buf << hOpen.rdbuf();
+    hOpen.close();
+    string content=buf.str();
 
-	struct tm tNow;
-	parseTime(timeStamp,&tNow);
-	*t= difftime(mktime(&tNow),mktime(tOld));
-	cout<<"time elapsed: "<<*t<<endl;
-	*tOld=tNow;
+    // CameraGUI writes a time stamp line and then one line of six numbers. Until that second line
+    // ends in a newline the file may still be being written: leave it for the next poll.
+    if(content.empty()||content[content.size()-1]!='\n') {return HERALD_INCOMPLETE;}
+    istringstream hRead(content);
+    string timeStamp;
+    double temp[6];
+    struct tm tNow;
+    getline(hRead,timeStamp);
+    if((hRead >> temp[0] >> temp[1] >> temp[2] >> temp[3] >> temp[4] >> temp[5]).fail()||!parseTime(timeStamp,&tNow))
+	{return HERALD_INCOMPLETE;}
 
-
-
-	return true;
+    // Now check the values to see if they're sane
+    if(fabs(temp[0])<100&&fabs(temp[2])<100&&temp[1]>1e-4&&temp[1]<10&&temp[3]>1e-4&&temp[3]<10)
+	{
+	// it's safe to use these values
+	x[0] = temp[0];
+	x[1] = temp[1];
+	y[0] = temp[2];
+	y[1] = temp[3];
+	z[0] = temp[4];
+	z[1] = temp[5];
 	}
     else
 	{
-	return false;
+	cout << "Bad values in herald file!" << endl;
+	// overwrite values with some safe defaults
+	x[0] = 0; x[1] = 1e10;
+	y[0] = 0; y[1] = 1e10;
+	z[0] = 0; z[1] = 1e10;
+	}
+    cout<<"current measurement: "<<timeStamp<<endl;
+
+    *t= difftime(mktime(&tNow),mktime(tOld));
+    cout<<"time elapsed: "<<*t<<endl;
+    *tOld=tNow;
+
+    return HERALD_OK;
+    }
+/*------------------------------------------------------------------------------------------------------*/
+
+void readParameter()
+    {
+    ifstream read(paraFile.c_str());
+    if(!read.is_open())
+	{
+	cout<<"No "<<paraFile<<" in the current folder, using the built-in defaults"<<endl;
+	}
+    string line;
+    while(read.is_open()&&getline(read,line))
+	{
+	istringstream in(line);
+	string key, value;
+	if(!(in>>key)||key[0]=='#') {continue;}
+	getline(in>>ws,value); // the rest of the line, so paths may contain spaces
+	while(!value.empty()&&isspace((unsigned char)value[value.size()-1])) {value.erase(value.size()-1);}
+	if(key=="herald")        {herald=value;}
+	else if(key=="log")      {logF=value;}
+	else if(key=="flogdir")  {flogDir=value;}
+	else if(key=="steps")    {stepsFile=value;}
+	else if(key=="comport")  {comPort=value;}
+	else if(key=="xS"||key=="yS"||key=="zS")
+	    {
+	    double v;
+	    if((istringstream(value)>>v).fail()) {cout<<"Bad number for "<<key<<" in "<<paraFile<<": "<<value<<endl;}
+	    else {setpoint[key[0]-'x']=v;}
+	    }
+	else {cout<<"Unknown key in "<<paraFile<<": "<<key<<endl;}
+	}
+    cout<<"herald file:  "<<herald<<endl;
+    cout<<"last-value log: "<<logF<<endl;
+    cout<<"drift logs:   "<<flogDir<<endl;
+    cout<<"step counters: "<<stepsFile<<endl;
+    cout<<"COM port:     "<<comPort<<endl;
+    cout<<"setpoints:    x "<<setpoint[0]<<" px, y "<<setpoint[1]<<" px, z "<<setpoint[2]
+	<<" um (z is used within "<<zWindow<<" um of its setpoint)"<<endl;
+    }
+
+/*------------------------------------------------------------------------------------------------------*/
+void loadSteps(int *steps)
+    {
+    ifstream read(stepsFile.c_str());
+    int temp[3];
+    if(read.is_open()&&!(read>>temp[0]>>temp[1]>>temp[2]).fail())
+	{
+	for(short i=0;i<3;i++) {steps[i]=temp[i];}
+	}
+    else
+	{
+	cout<<"No step counters in "<<stepsFile<<", starting from 0"<<endl;
+	for(short i=0;i<3;i++) {steps[i]=0;}
 	}
     }
-/*------------------------------------------------------------------------------------------------------*/
 
-void readParameter(double * para)
+void saveSteps(int *steps)
     {
-    ifstream read;
+    ofstream write(stepsFile.c_str());
+    write<<steps[0]<<"\t"<<steps[1]<<"\t"<<steps[2]<<endl;
+    }
 
-
+void warnRange(int *steps)
+    {
+    const char axisName[]="xyz";
+    for(short i=0;i<3;i++)
+	{
+	if(steps[i]>maxsteps[i]||steps[i]<-maxsteps[i])
+	    {
+	    cout<<"WARNING: "<<axisName[i]<<" has moved "<<steps[i]<<" steps since the counters were zeroed (limit "
+		<<maxsteps[i]<<"), it may be near the rail. Type \"m "<<axisName[i]<<" <steps>\" to move it back.\a"<<endl;
+	    }
+	}
     }
 
 /*------------------------------------------------------------------------------------------------------*/
+double clampSteps(double c, int lim, bool *coerced)
+    {
+    if(c>lim)  {*coerced=true; return lim;}
+    if(c<-lim) {*coerced=true; return -lim;}
+    return c;
+    }
+
 void PID(double* xl,double* yl,double* zl, double* xc,double* yc,double* zc, double t, double *c)
     {
     bool coerceflag = false; // tells if the step size exceeds limits
@@ -190,31 +294,22 @@ void PID(double* xl,double* yl,double* zl, double* xc,double* yc,double* zc, dou
     cout<< fixed << setprecision (3)<<xc[0]<<"+/-"<<xc[1]<<" "<<yc[0]<<"+/-"<<yc[1]<<" "<<zc[0]<<"+/-"<<zc[1]<<endl;
 
     bool errorFlag=true;
-    if(abs(xc[0])<5&&abs(yc[0])<5&&xc[1]>1e-4&&xc[1]<10&&yc[1]>1e-4&&yc[1]<10) //Sanity check on input values
+    if(fabs(xc[0])<5&&fabs(yc[0])<5&&xc[1]>1e-4&&xc[1]<10&&yc[1]>1e-4&&yc[1]<10) //Sanity check on input values
 	{
 	errorFlag=false;
 	}
-   /* else
-	{
-	cout << "Bad position data on X and Y!" << endl;
-	}
-   */
 
     double beta[3];
 	for (short i=0;i<3;i++)
-	    {beta[i]=exp(-t/decay[i]);}
+	    {beta[i]=exp(-t/decayT[i]);}
 
 
 	/*Z correction*/
-	if(t!=0&&abs(zc[0]-zS)<2&&zc[1]>1e-4&&zc[1]<5)  //recall the absolute position for z contains objective position, which lies within 0~10
+	if(t!=0&&fabs(zc[0]-setpoint[2])<zWindow&&zc[1]>1e-4&&zc[1]<5)  //recall the absolute position for z contains objective position, which lies within 0~10
 	    {
 	    double temp;
 	    //proportional gain
-	    c[2] = -alpha[2]*(zc[0]-zS);
-	    //calculate running average for integral gain
-	    //temp=1/((1-beta[2])/zc[1]/zc[1]+beta[2]/zl[1]/zl[1]);                       //uncertainty
-	    //zc[0]=temp*((1-beta[2])/zc[1]/zc[1]*zc[0]+beta[2]/zl[1]/zl[1]*zl[0]); //update value
-	    //zc[1]=sqrt(temp);							//update uncertainty
+	    c[2] = -alpha[2]*(zc[0]-setpoint[2]);
 
 	    // New algorithm 20120420, fixed an algebra mistake in derivation
 	    // that would cause errors when t << decay
@@ -223,21 +318,12 @@ void PID(double* xl,double* yl,double* zl, double* xc,double* yc,double* zc, dou
 	    zc[1] = sqrt(temp*temp*zc[1]*zc[1]+(1-temp)*(1-temp)*zl[1]*zl[1]); // uncertainty
 
 	    //integral gain
-	    c[2] += -gamma[2]*(zc[0]-zS);
+	    c[2] += -gammaI[2]*(zc[0]-setpoint[2]);
 	    //change to step
-	    c[2] *= zconv;//38;
+	    c[2] *= conv[2];
 
 	    //coerce
-	    if (c[2]>zlimit)
-		{
-		c[2] = zlimit;
-		coerceflag = true;
-		}
-	    if (c[2]< -zlimit)
-		{
-		c[2] = zlimit;
-		coerceflag = true;
-		}
+	    c[2] = clampSteps(c[2],limit[2],&coerceflag);
 
 	    //update running average
 	    zl[0]=zc[0];zl[1]=zc[1];
@@ -246,6 +332,11 @@ void PID(double* xl,double* yl,double* zl, double* xc,double* yc,double* zc, dou
 	else
 	    {
 	    cout << "Bad position data on Z OR no update." << endl;
+	    if(t!=0&&zc[1]>1e-4&&zc[1]<5)
+		{
+		cout << "  z = " << zc[0] << " is more than " << zWindow << " um from the z setpoint " << setpoint[2]
+		     << "; zS in " << paraFile << " should match the camera's Objective Position." << endl;
+		}
 	    c[2]=0;
 	    zl[1] = zl[1]/beta[2];
 	    if(isnan(zl[1])||isinf(zl[1])!=0) // Check for fault conditions
@@ -263,17 +354,8 @@ void PID(double* xl,double* yl,double* zl, double* xc,double* yc,double* zc, dou
 	double temp;
 
 	//proportional gain
-	c[0] = -alpha[0]*(xc[0]-xS);
-	c[1] = -alpha[1]*(yc[0]-yS);
-
-
-	//calculate running average for integral gain
-	//temp=1/((1-beta[0])/xc[1]/xc[1]+beta[0]/xl[1]/xl[1]);                       //uncertainty
-	//xc[0]=temp*((1-beta[0])/xc[1]/xc[1]*xc[0]+beta[0]/xl[1]/xl[1]*xl[0]); //update value
-	//xc[1]=sqrt(temp);                                         //update uncertainty
-	//temp=1/((1-beta[1])/yc[1]/yc[1]+beta[1]/yl[1]/yl[1]);                       //uncertainty
-	//yc[0]=temp*((1-beta[1])/yc[1]/yc[1]*yc[0]+beta[1]/yl[1]/yl[1]*yl[0]); //update value
-	//yc[1]=sqrt(temp);                                         //update uncertainty
+	c[0] = -alpha[0]*(xc[0]-setpoint[0]);
+	c[1] = -alpha[1]*(yc[0]-setpoint[1]);
 
 	// New algorithm 20120420, fixed an algebra mistake in derivation
         // that would cause errors when t << decay
@@ -287,37 +369,17 @@ void PID(double* xl,double* yl,double* zl, double* xc,double* yc,double* zc, dou
 
 
 	//integral gain
-	c[0] += -gamma[0]*(xc[0]-xS);
-	c[1] += -gamma[1]*(yc[0]-yS);
+	c[0] += -gammaI[0]*(xc[0]-setpoint[0]);
+	c[1] += -gammaI[1]*(yc[0]-setpoint[1]);
 
 
 	//change to step
-	c[0] *= xconv;//310/9.23;
-	c[1] *= yconv;//160/9.57;
+	c[0] *= conv[0];
+	c[1] *= conv[1];
 
-	    //coerce
-	    if (c[0]>xlimit)
-		{
-		c[0] = xlimit;
-		coerceflag = true;
-		}
-	    if (c[0]< -xlimit)
-		{
-		c[0] = xlimit;
-		coerceflag = true;
-		}
-	    if (c[1]>ylimit)
-		{
-		c[1] = ylimit;
-		coerceflag = true;
-		}
-	    if (c[1]< -ylimit)
-		{
-		c[1] = ylimit;
-		coerceflag = true;
-		}
-
-
+	//coerce
+	c[0] = clampSteps(c[0],limit[0],&coerceflag);
+	c[1] = clampSteps(c[1],limit[1],&coerceflag);
 
 	//update running average
 	for (short i=0;i<2;i++)
@@ -330,15 +392,11 @@ void PID(double* xl,double* yl,double* zl, double* xc,double* yc,double* zc, dou
     else
 	{
 	cout<< "Bad position data on X and Y OR no updates." << endl;
-	for(short i=0;i<2;i++)
-	    {
-	    c[i]=0; // corrections equal to zero for fail
-	    // don't replace the running average with the measurement,
-	    // but do "age" it by increasing the uncertainty
-	    xl[1] = xl[1]/beta[0];
-	    yl[1] = yl[1]/beta[1];
-
-	    }
+	c[0]=0; c[1]=0; // corrections equal to zero for fail
+	// don't replace the running average with the measurement,
+	// but do "age" it by increasing the uncertainty
+	xl[1] = xl[1]/beta[0];
+	yl[1] = yl[1]/beta[1];
         }
 	if (coerceflag)
 	    {
@@ -363,126 +421,34 @@ bool checkRange(int *c)
     return false;
     }
 /*------------------------------------------------------------------------------------------------------*/
-void SetCom(HANDLE hPort,double * cRaw)   //set values to each channels
+int moveChannel(HANDLE hPort, int channel, int steps)
     {
-    int c[3]; for (short i=0;i<3;i++){c[i]=(int)rint(cRaw[i]);}
+    int err=0;
+    DWORD written=0;
+    char cmd[32];
 
+    /*change channel*/
+    int n=snprintf(cmd,sizeof(cmd),"%s%d%s",changeChannel.c_str(),channel,endLine.c_str());
+    if(!WriteFile(hPort, cmd, n, &written, NULL)||written!=(DWORD)n){cerr<<"error in changing to channel "<<channel<<endl; err += 1;}
+
+    /*write to the 1 axis (default) of the channel*/
+    n=snprintf(cmd,sizeof(cmd),"%s%d%s",moveCmd.c_str(),steps,endLine.c_str());
+    if(!WriteFile(hPort, cmd, n, &written, NULL)||written!=(DWORD)n){cerr<<"error in moving channel "<<channel<<endl; err += 2;}
+    cout<<"channel "<< channel << " moves " << steps << " steps"<<endl;
+
+    Sleep(100);
+    return err;
+    }
+
+int SetCom(HANDLE hPort,int * c)   //set values to each channels
+    {
+    int err=0;
     cout<<"correction: ";
     cout << c[0] << " "<< c[1] << " "<< c[2] << endl;
-
-    //c[0]=1;c[1]=20;c[2]=10;
-
-
-/*testing
-       string DATA=move;
-       char step[5];
-       itoa(10,step,10);
-       DATA.append(step);
-       DWORD written=0;
-    	DATA.append(endLine);
-    	char data[DATA.size()];
-    	DATA.copy(data,DATA.size(),0);
-    	  WriteFile(hPort, &data, DATA.size(), &written, NULL);
-    	  cout<<"size is "<<DATA.size()<<endl;
-    	  cout<<data<<endl;
-*/
-
-
-	{
-    DWORD written=0;
-    char channelIndex[1];
-    char step[2];
-//    char amp[2];
-//    char errorCode[3];
     for(short i=0;i<3;i++)
 	{
-	/*change channel*/
-	itoa(i+1,channelIndex,10);//int to string, base 10
-	string channel=changeChannel;
-	channel.append(channelIndex);
-	channel.append(endLine);
-	char dataC[channel.size()];
-	channel.copy(dataC,channel.size());
-	WriteFile(hPort, &dataC, channel.size(), &written, NULL);if(written!=channel.size()){cerr<<"error in changing channel!"<<endl;}
-	cout<<"channel "<< i+1 << " moves " << c[i] << " steps"<<endl;
-
-
-
-	/*set amplitudes
-	itoa(stepSize[i],amp,10);//int to string, base 10
-	string setAmp = amplitude;
-	setAmp.append(amp);
-	setAmp.append(endLine);
-	char dataA[setAmp.size()];
-	setAmp.copy(dataA,setAmp.size());
-	WriteFile(hPort,&dataA,setAmp.size(),&written,NULL);if(written!=setAmp.size()){cerr<<"error in setting amplitude in "<<i<<" axis"<<endl;}
-	cout<<" with amplitude "<< dataA  << endl;
-*/
-//	WriteFile(hPort, &tellError, 4, &written, NULL);
-//	ReadFile(hPort, &errorCode, 3, &written, NULL); cout<<"error code is "<<errorCode<<endl;
-
-	/*write to the 1 axis (default) of each channel*/
-	itoa(c[i],step,10);//int to string, base 10
-	string motion=move;
-	motion.append(step);
-	motion.append(endLine);
-	char dataM[motion.size()];
-	motion.copy(dataM,motion.size());
-	WriteFile(hPort,&dataM,motion.size(),&written,NULL);if(written!=motion.size()){cerr<<"error in moving "<<i<<" axis"<<endl;}
-
-
-	Sleep(100);
+	err += moveChannel(hPort,i+1,c[i]);
 	}
-    }
-
-    }
-
-int recenter(int axis)
-    {
-    /* Function to recenter the etalons,
-     * called when
-     * the etalon goes out of bounds.
-     */
-
-    char channelIndex[1]; // name of channel
-    char step[6]; // text number of steps
-    int err=0; // error flag
-    DWORD written=0;
-    /* The goal is to move the etalon to one edge and then approximately half way back. */
-    HANDLE hPort=CreateFile("COM6", GENERIC_READ|GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if(hPort==INVALID_HANDLE_VALUE)	{cerr<<"Fail to open COM port"<<endl;}
-	        err =+ InitCom(hPort);
-
-	        /*change channel*/
-	        itoa(axis+1,channelIndex,10);//int to string, base 10
-		string channel=changeChannel;
-		channel.append(channelIndex);
-		channel.append(endLine);
-		char dataC[channel.size()];
-		channel.copy(dataC,channel.size());
-		WriteFile(hPort, &dataC, channel.size(), &written, NULL);if(written!=channel.size()){cerr<<"error in changing channel!"<<endl;err =+ 8;}
-		cout<<"Recentering channel "<< axis+1 << " moves " << maxsteps << " steps"<<endl;
-
-		// move to end
-		itoa(-3*maxsteps[axis],step,10);//int to string, base 10
-		string motion=move;
-		motion.append(step);
-		motion.append(endLine);
-		char dataM[motion.size()];
-		motion.copy(dataM,motion.size());
-		WriteFile(hPort,&dataM,motion.size(),&written,NULL);if(written!=motion.size()){cerr<<"error in moving "<<axis<<" axis"<<endl; err =+ 16;}
-
-		// move back to center
-		itoa(maxsteps[axis],step,10);//int to string, base 10
-		motion=move;
-		motion.append(step);
-		motion.append(endLine);
-		 //dataM[motion.size()];
-		motion.copy(dataM,motion.size());
-		WriteFile(hPort,&dataM,motion.size(),&written,NULL);if(written!=motion.size()){cerr<<"error in moving "<<axis<<" axis"<<endl; err =+ 32;}
-
-	   CloseHandle(hPort);
-
     return err;
     }
 

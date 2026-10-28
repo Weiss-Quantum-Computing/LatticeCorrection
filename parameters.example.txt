@@ -1,0 +1,21 @@
+# Copy this file to parameters.txt in the folder LatticeCorrection.exe is started from.
+# Every line is optional; anything left out keeps the built-in default from src/constant.h.
+# Lines starting with # are ignored.
+
+# Written by CameraGUI after each run (its data folder + herald.txt)
+herald   C:/Users/Yang/Documents/Data/CameraControl/herald.txt
+# Last running average, read at start-up
+log      C:/Users/Yang/Documents/Data/CameraControl/LClog.txt
+# Folder for the flog-YYYYMMDD-HHMMSS.txt drift logs
+flogdir  C:/Users/Yang/Documents/Data/latticelog
+# Step counters per axis, kept across restarts
+steps    LCsteps.txt
+# Piezo controller port. From COM10 up, write it as \\.\COM10
+comport  COM6
+
+# Setpoints: x and y in camera pixels, z in um.
+# CameraGUI reports z as deltaZ + "Objective Position", so set zS to the
+# Objective Position value in the GUI (0 unless you changed it).
+xS  0
+yS  0
+zS  0

@@ -8,3 +8,7 @@ Release/
 .DS_Store
 ._*
 Thumbs.db
+
+# --- per-machine settings and state ---
+parameters.txt
+LCsteps.txt
