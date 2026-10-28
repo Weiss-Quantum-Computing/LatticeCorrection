@@ -1,0 +1,10 @@
+# --- build artifacts ---
+Debug/
+Release/
+*.o
+*.exe
+
+# --- OS cruft ---
+.DS_Store
+._*
+Thumbs.db
